@@ -213,25 +213,27 @@ def reserve_upload(upload_type: str, receiver_id: int):
     with db_lock, db_connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            cooldown_cutoff = utc_iso(utc_now() - timedelta(hours=COOLDOWN_HOURS))
-            recent = conn.execute(
-                """
-                SELECT delivered_at FROM deliveries
-                JOIN uploads ON uploads.upload_id = deliveries.upload_id
-                WHERE deliveries.receiver_id = ?
-                  AND deliveries.status = 'sent'
-                  AND uploads.upload_type = ?
-                  AND deliveries.delivered_at >= ?
-                ORDER BY deliveries.delivered_at DESC
-                LIMIT 1
-                """,
-                (receiver_id, upload_type, cooldown_cutoff),
-            ).fetchone()
+           # Owner has no 12-hour receive cooldown.
+if receiver_id != OWNER_ID:
+    cooldown_cutoff = utc_iso(utc_now() - timedelta(hours=COOLDOWN_HOURS))
+    recent = conn.execute(
+        """
+        SELECT delivered_at FROM deliveries
+        JOIN uploads ON uploads.upload_id = deliveries.upload_id
+        WHERE deliveries.receiver_id = ?
+          AND deliveries.status = 'sent'
+          AND uploads.upload_type = ?
+          AND deliveries.delivered_at >= ?
+        ORDER BY deliveries.delivered_at DESC
+        LIMIT 1
+        """,
+        (receiver_id, upload_type, cooldown_cutoff),
+    ).fetchone()
 
-            if recent:
-                conn.execute("ROLLBACK")
-                remaining = parse_utc(recent["delivered_at"]) + timedelta(hours=COOLDOWN_HOURS) - utc_now()
-                return {"kind": "cooldown", "remaining": max(remaining, timedelta(0))}
+    if recent:
+        conn.execute("ROLLBACK")
+        remaining = parse_utc(recent["delivered_at"]) + timedelta(hours=COOLDOWN_HOURS) - utc_now()
+        return {"kind": "cooldown", "remaining": max(remaining, timedelta(0))}
 
             row = conn.execute(
                 """
@@ -356,6 +358,13 @@ def get_all_uploads():
             """
         ).fetchall()
 
+def delete_upload(upload_id: str) -> bool:
+    with db_lock, db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM uploads WHERE upload_id=?",
+            (upload_id,),
+        )
+        return cur.rowcount == 1
 
 def format_user(username: str | None, full_name: str) -> str:
     return f"@{username}" if username else (full_name or "Unknown")
@@ -442,11 +451,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "/start\n/help\n/id\n/checkall\n/checkyourupload\n\n"
-        "Owner commands:\n/add USERID\n/remove USERID\n\n"
+        "Owner commands:\n/add USERID\n/remove USERID\n/delete_post UPLOAD_ID\n\n"
         "Upload requires Telegram DOCUMENT/FILE.\n"
         "Normal photo/video messages are not accepted.\n"
         "Receive is only available to authorized users.\n"
-        "Thumbnail and Video each have their own 12-hour limit."
+        "Thumbnail and Video each have their own 12-hour limit.\n"
+"Owner has no receive cooldown/limit."
     )
     await update.effective_message.reply_text(text)
 
@@ -488,6 +498,43 @@ async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     set_authorized(target, False)
     await update.effective_message.reply_text(f"✅ User {target} removed. They can no longer receive.")
 
+async def delete_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await update.effective_message.reply_text("❌ Owner only.")
+        return
+
+    if len(context.args) != 1:
+        await update.effective_message.reply_text(
+            "Usage: /delete_post UPLOAD_ID"
+        )
+        return
+
+    upload_id = context.args[0].strip()
+
+    if not upload_id or len(upload_id) > 128:
+        await update.effective_message.reply_text("❌ Invalid upload ID.")
+        return
+
+    try:
+        deleted = await asyncio.to_thread(delete_upload, upload_id)
+    except sqlite3.Error:
+        logger.exception("Could not delete upload %s", upload_id)
+        await update.effective_message.reply_text(
+            "❌ Database error. The upload was not deleted."
+        )
+        return
+
+    if not deleted:
+        await update.effective_message.reply_text(
+            f"❌ Upload ID not found: {upload_id}"
+        )
+        return
+
+    await update.effective_message.reply_text(
+        f"🗑 Upload deleted successfully.\n\nUpload ID: {upload_id}"
+    )
 
 async def checkyourupload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -780,6 +827,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("add", add_command))
     application.add_handler(CommandHandler("remove", remove_command))
+    application.add_handler(CommandHandler("delete_post", delete_post_command))
     application.add_handler(CommandHandler("checkyourupload", checkyourupload))
     application.add_handler(CommandHandler("checkall", checkall))
     application.add_handler(CallbackQueryHandler(callback_handler))
