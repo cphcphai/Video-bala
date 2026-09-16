@@ -213,27 +213,36 @@ def reserve_upload(upload_type: str, receiver_id: int):
     with db_lock, db_connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
-           # Owner has no 12-hour receive cooldown.
-if receiver_id != OWNER_ID:
-    cooldown_cutoff = utc_iso(utc_now() - timedelta(hours=COOLDOWN_HOURS))
-    recent = conn.execute(
-        """
-        SELECT delivered_at FROM deliveries
-        JOIN uploads ON uploads.upload_id = deliveries.upload_id
-        WHERE deliveries.receiver_id = ?
-          AND deliveries.status = 'sent'
-          AND uploads.upload_type = ?
-          AND deliveries.delivered_at >= ?
-        ORDER BY deliveries.delivered_at DESC
-        LIMIT 1
-        """,
-        (receiver_id, upload_type, cooldown_cutoff),
-    ).fetchone()
+            # OWNER_ID has no receive cooldown/limit.
+            if receiver_id != OWNER_ID:
+                cooldown_cutoff = utc_iso(
+                    utc_now() - timedelta(hours=COOLDOWN_HOURS)
+                )
+                recent = conn.execute(
+                    """
+                    SELECT delivered_at FROM deliveries
+                    JOIN uploads ON uploads.upload_id = deliveries.upload_id
+                    WHERE deliveries.receiver_id = ?
+                      AND deliveries.status = 'sent'
+                      AND uploads.upload_type = ?
+                      AND deliveries.delivered_at >= ?
+                    ORDER BY deliveries.delivered_at DESC
+                    LIMIT 1
+                    """,
+                    (receiver_id, upload_type, cooldown_cutoff),
+                ).fetchone()
 
-    if recent:
-        conn.execute("ROLLBACK")
-        remaining = parse_utc(recent["delivered_at"]) + timedelta(hours=COOLDOWN_HOURS) - utc_now()
-        return {"kind": "cooldown", "remaining": max(remaining, timedelta(0))}
+                if recent:
+                    conn.execute("ROLLBACK")
+                    remaining = (
+                        parse_utc(recent["delivered_at"])
+                        + timedelta(hours=COOLDOWN_HOURS)
+                        - utc_now()
+                    )
+                    return {
+                        "kind": "cooldown",
+                        "remaining": max(remaining, timedelta(0)),
+                    }
 
             row = conn.execute(
                 """
@@ -244,9 +253,9 @@ if receiver_id != OWNER_ID:
                       SELECT 1 FROM deliveries d
                       WHERE d.upload_id = u.upload_id
                         AND d.receiver_id = ?
-                        AND d.status IN ('reserved','sent')
+                        AND d.status IN ('reserved', 'sent')
                   )
-                ORDER BY u.created_at ASC, u.upload_id ASC
+                ORDER BY u.created_at ASC
                 LIMIT 1
                 """,
                 (upload_type, receiver_id),
@@ -259,17 +268,19 @@ if receiver_id != OWNER_ID:
             try:
                 conn.execute(
                     """
-                    INSERT INTO deliveries(upload_id, receiver_id, status, reserved_at, delivered_at)
-                    VALUES(?, ?, 'reserved', ?, NULL)
+                    INSERT INTO deliveries
+                    (upload_id, receiver_id, status, reserved_at)
+                    VALUES (?, ?, 'reserved', ?)
                     """,
                     (row["upload_id"], receiver_id, now),
                 )
             except sqlite3.IntegrityError:
                 conn.execute("ROLLBACK")
-                return {"kind": "empty"}
+                return {"kind": "retry"}
 
             conn.execute("COMMIT")
             return {"kind": "reserved", "upload": dict(row)}
+
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -365,6 +376,33 @@ def delete_upload(upload_id: str) -> bool:
             (upload_id,),
         )
         return cur.rowcount == 1
+
+def get_uploads_by_filter(upload_type: str | None = None):
+    with db_lock, db_connect() as conn:
+        if upload_type:
+            return conn.execute(
+                """
+                SELECT upload_id, uploader_id, uploader_username,
+                       uploader_name, upload_type,
+                       telegram_file_id, telegram_file_unique_id,
+                       created_at
+                FROM uploads
+                WHERE upload_type = ?
+                ORDER BY created_at DESC
+                """,
+                (upload_type,),
+            ).fetchall()
+
+        return conn.execute(
+            """
+            SELECT upload_id, uploader_id, uploader_username,
+                   uploader_name, upload_type,
+                   telegram_file_id, telegram_file_unique_id,
+                   created_at
+            FROM uploads
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
 
 def format_user(username: str | None, full_name: str) -> str:
     return f"@{username}" if username else (full_name or "Unknown")
@@ -535,6 +573,88 @@ async def delete_post_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.effective_message.reply_text(
         f"🗑 Upload deleted successfully.\n\nUpload ID: {upload_id}"
     )
+
+async def filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+
+    if not user or user.id != OWNER_ID:
+        await update.effective_message.reply_text("❌ Owner only.")
+        return
+
+    if len(context.args) > 1:
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "/filter - All files\n"
+            "/filter thumbnail - Thumbnail files\n"
+            "/filter video - Video files"
+        )
+        return
+
+    upload_type = None
+
+    if context.args:
+        upload_type = context.args[0].lower()
+
+        if upload_type not in {"thumbnail", "video"}:
+            await update.effective_message.reply_text(
+                "❌ Invalid filter.\n\n"
+                "Use:\n"
+                "/filter\n"
+                "/filter thumbnail\n"
+                "/filter video"
+            )
+            return
+
+    try:
+        rows = await asyncio.to_thread(
+            get_uploads_by_filter,
+            upload_type,
+        )
+    except sqlite3.Error:
+        logger.exception("Could not filter uploads")
+        await update.effective_message.reply_text(
+            "❌ Database error."
+        )
+        return
+
+    if not rows:
+        await update.effective_message.reply_text(
+            "📂 No uploads found."
+        )
+        return
+
+    title = (
+        "📂 ALL UPLOADS"
+        if upload_type is None
+        else f"📂 {upload_type.upper()} UPLOADS"
+    )
+
+    messages = [title]
+
+    for row in rows:
+        username = (
+            f"@{row['uploader_username']}"
+            if row["uploader_username"]
+            else "No username"
+        )
+
+        messages.append(
+            "\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 Upload ID: {row['upload_id']}\n"
+            f"📁 Type: {row['upload_type']}\n"
+            f"👤 User ID: {row['uploader_id']}\n"
+            f"👤 Username: {username}\n"
+            f"📝 Name: {row['uploader_name']}\n"
+            f"🕒 Uploaded: {row['created_at']}\n"
+            f"🔑 File ID: {row['telegram_file_id']}\n"
+            f"🔐 Unique ID: {row['telegram_file_unique_id']}"
+        )
+
+    text = "\n".join(messages)
+
+    for chunk in split_message(text):
+        await update.effective_message.reply_text(chunk)
 
 async def checkyourupload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -827,6 +947,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("id", id_command))
     application.add_handler(CommandHandler("add", add_command))
     application.add_handler(CommandHandler("remove", remove_command))
+    application.add_handler(CommandHandler("filter", filter_command))
     application.add_handler(CommandHandler("delete_post", delete_post_command))
     application.add_handler(CommandHandler("checkyourupload", checkyourupload))
     application.add_handler(CommandHandler("checkall", checkall))
